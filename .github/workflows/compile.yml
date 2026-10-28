@@ -722,7 +722,7 @@ jobs:
       map: gm_glua_tests
 
   test_32bit_find_crash:
-    if: false # always() Enable it if a unknown crash is happening. We'll test every single module.
+    if: always() # always() Enable it if a unknown crash is happening. We'll test every single module.
     name: "Find the crash cause"
     needs: setup_artifacts
     uses: RaphaelIT7/GLuaTest/.github/workflows/run_tests.yml@holylib_v2
@@ -759,15 +759,15 @@ jobs:
           - soundscape
           - luajit
         branch:
-          - public
+        #  - public
           - dev
-          - prerelease
-        extra:
-          - 1
-          - 2
-          - 3
+        #  - prerelease
+        #extra:
+        #  - 1
+        #  - 2
+        #  - 3
     with:
-      branch: dev
+      branch: ${{ matrix.branch }}
       extra-startup-args: "-usegh -holylib_enable_${{ matrix.module }} 0"
       download-artifact: "gluatest_32x"
       no-checkout: "true"
