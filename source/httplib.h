@@ -4481,8 +4481,17 @@ template <typename T>
 bool read_content(Stream &strm, T &x, size_t payload_max_length, int &status,
 				  Progress progress, ContentReceiverWithProgress receiver,
 				  bool decompress) {
+  // Bound decoded bytes before the receiver can append them. Content-Length
+  // alone cannot limit chunked/EOF-delimited bodies or decompression output.
+  size_t received = 0;
+  bool exceeded = false;
+  auto bounded_receiver = [&](const char *buf, size_t n, uint64_t off, uint64_t len) {
+	if (n > payload_max_length - received) { exceeded = true; return false; }
+	received += n;
+	return receiver(buf, n, off, len);
+  };
   return prepare_content_receiver(
-	  x, status, std::move(receiver), decompress,
+	  x, status, bounded_receiver, decompress,
 	  [&](const ContentReceiverWithProgress &out) {
 		auto ret = true;
 		auto exceed_payload_max_length = false;
@@ -4501,7 +4510,6 @@ bool read_content(Stream &strm, T &x, size_t payload_max_length, int &status,
 			ret = false;
 		  } else if (len > payload_max_length) {
 			exceed_payload_max_length = true;
-			skip_content_with_length(strm, len);
 			ret = false;
 		  } else if (len > 0) {
 			ret = read_content_with_length(strm, len, std::move(progress), out);
@@ -4509,7 +4517,7 @@ bool read_content(Stream &strm, T &x, size_t payload_max_length, int &status,
 		}
 
 		if (!ret) {
-		  status = exceed_payload_max_length ? StatusCode::PayloadTooLarge_413
+		  status = (exceeded || exceed_payload_max_length) ? StatusCode::PayloadTooLarge_413
 											 : StatusCode::BadRequest_400;
 		}
 		return ret;
@@ -7338,6 +7346,12 @@ Server::process_request(Stream &strm, const std::string &remote_addr,
 	}
   }
 #endif
+  // Oversized bodies are deliberately not drained. Do not reinterpret their
+  // unread bytes as another request on a keep-alive connection.
+  if (res.status == StatusCode::PayloadTooLarge_413) {
+	connection_closed = true;
+	close_connection = true;
+  }
   if (routed) {
 	if (res.status == -1) {
 	  res.status = req.ranges.empty() ? StatusCode::OK_200

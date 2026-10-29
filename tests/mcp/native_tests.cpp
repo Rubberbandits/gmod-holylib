@@ -64,6 +64,61 @@ static void CaptureTests() {
       std::thread engine([&] { racing.Append("other-thread", 12); }); engine.join(); }
     CHECK(racing.Read(position).records[0].text == "other-thread");
 }
+static void UnicodeCaptureTests() {
+    const std::string units[] = {"\xC2\xA2", "\xE2\x82\xAC", "\xF0\x9F\x9A\x80"};
+    for (const auto& unit : units) {
+        for (size_t budget = 1; budget <= 5; ++budget) {
+            for (size_t prefix = 0; prefix <= 5; ++prefix) {
+                HolyConsole::Buffer buffer;
+                const std::string text = std::string(prefix, 'x') + unit + unit + "end";
+                buffer.Append(text.data(), text.size());
+                std::string cursor, output;
+                size_t reads = 0;
+                while (true) {
+                    auto batch = buffer.Read(cursor, 1, budget);
+                    CHECK(!batch.reset && batch.cursor != cursor);
+                    CHECK(batch.records.size() == 1);
+                    CHECK(HolyHTTP::UTF8(batch.records[0].text));
+                    CHECK(batch.records[0].text.size() <= std::max(budget, unit.size()));
+                    output += batch.records[0].text;
+                    cursor = batch.cursor;
+                    CHECK(++reads <= text.size());
+                    if (!batch.hasMore) break;
+                }
+                CHECK(output == text);
+            }
+        }
+        for (size_t padding = 1; padding < unit.size(); ++padding) {
+            HolyConsole::Buffer buffer;
+            const std::string text = std::string(8192 - padding, 'x') + unit + std::string(9000, 'y');
+            buffer.Append(text.data(), text.size());
+            auto batch = buffer.Read("", 10, 65536);
+            std::string output;
+            for (const auto& record : batch.records) {
+                CHECK(record.text.size() <= 8192 && HolyHTTP::UTF8(record.text));
+                output += record.text;
+            }
+            CHECK(output == text && !batch.hasMore);
+        }
+        HolyConsole::Buffer buffer;
+        const auto before = buffer.GetCursor();
+        buffer.Append(unit.data(), unit.size());
+        auto middle = before.substr(0, before.rfind(':') + 1) + "1";
+        CHECK(buffer.Read(middle).reset); // A cursor may not cut a valid code point.
+    }
+    HolyConsole::Buffer invalid;
+    const std::string bytes = "\xFF\xC0\x80\xED\xA0\x80";
+    invalid.Append(bytes.data(), bytes.size());
+    std::string cursor, recovered;
+    do {
+        auto batch = invalid.Read(cursor, 1, 1);
+        CHECK(batch.records.size() == 1 && batch.records[0].text.size() == 1);
+        recovered += batch.records[0].text;
+        cursor = batch.cursor;
+        if (!batch.hasMore) break;
+    } while (true);
+    CHECK(recovered == bytes); // Invalid source bytes remain available for JSON repair.
+}
 static void FramingTests() {
     HolyHTTP::Stream stream;
     std::string error, frame;
@@ -171,7 +226,86 @@ static void NetworkTests() {
     quiet.Get("/stream", [&](const char* data, size_t size) { beat = std::string(data, size).find(": heartbeat") != std::string::npos; return false; });
     heartbeat->Abort("shutdown"); heartbeatServer.stop(); heartbeatListener.join(); CHECK(beat);
 }
+static void PayloadLimitTests() {
+    httplib::Server server;
+    server.set_payload_max_length(1024);
+    server.set_read_timeout(2, 0);
+    std::atomic<unsigned> handled{0};
+    server.Post("/mcp", [&](const httplib::Request& req, httplib::Response& res) {
+        ++handled;
+        res.status = req.has_header("Authorization") ? 200 : 401;
+        res.set_content(std::to_string(req.body.size()), "text/plain");
+    });
+    const int port = server.bind_to_any_port("127.0.0.1"); CHECK(port > 0);
+    struct Running {
+        httplib::Server& server;
+        std::thread listener;
+        explicit Running(httplib::Server& s) : server(s), listener([&s] { s.listen_after_bind(); }) {}
+        ~Running() { server.stop(); listener.join(); }
+    } running(server);
+    httplib::Client client("127.0.0.1", port);
+    client.set_read_timeout(2, 0);
+    auto ordinary = client.Post("/mcp", std::string(1025, 'x'), "application/json");
+    CHECK(ordinary && ordinary->status == 413 && ordinary->get_header_value("Connection") == "close");
+    CHECK(handled == 0);
+    // Exercise individual and cumulative chunk limits, with no auth header.
+    for (const auto& chunks : {std::vector<size_t>{2048}, std::vector<size_t>{600, 600}, std::vector<size_t>{1024, 1}}) {
+        size_t i = 0;
+        auto response = client.Post("/mcp", [&](size_t, httplib::DataSink& sink) {
+            if (i == chunks.size()) { sink.done(); return true; }
+            const std::string data(chunks[i++], 'x');
+            return sink.write(data.data(), data.size());
+        }, "application/json");
+        CHECK(response && response->status == 413 && response->get_header_value("Connection") == "close");
+        CHECK(handled == 0);
+    }
+    for (size_t length : {size_t(0), size_t(1024)}) {
+        bool sent = false;
+        auto response = client.Post("/mcp", [&](size_t, httplib::DataSink& sink) {
+            if (sent || length == 0) { sink.done(); return true; }
+            sent = true;
+            const std::string data(length, 'x');
+            return sink.write(data.data(), data.size());
+        }, "application/json");
+        CHECK(response && response->status == 401 && response->body == std::to_string(length));
+    }
+    CHECK(handled == 2);
+
+    // An oversized declared body/chunk must be rejected before EOF or a final
+    // chunk arrives. This also prevents draining an attacker-controlled body.
+    for (bool chunked : {false, true}) {
+        const socket_t sock = socket(AF_INET, SOCK_STREAM, 0); CHECK(sock != INVALID_SOCKET);
+        sockaddr_in address{}; address.sin_family = AF_INET;
+        address.sin_addr.s_addr = htonl(INADDR_LOOPBACK); address.sin_port = htons(static_cast<unsigned short>(port));
+        CHECK(connect(sock, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0);
+        const std::string wire = std::string("POST /mcp HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n")
+            + (chunked ? "Transfer-Encoding: chunked\r\n\r\n100000\r\n" + std::string(1025, 'x') : "Content-Length: 1048576\r\n\r\n");
+        size_t sent = 0;
+        while (sent < wire.size()) {
+            const auto n = send(sock, wire.data() + sent, static_cast<int>(wire.size() - sent), 0);
+            CHECK(n > 0); sent += static_cast<size_t>(n);
+        }
+        std::string response;
+        while (response.find("\r\n\r\n") == std::string::npos) {
+            CHECK(httplib::detail::select_read(sock, 1, 0) > 0);
+            char bytes[4096]; const auto n = recv(sock, bytes, sizeof(bytes), 0);
+            CHECK(n > 0); response.append(bytes, static_cast<size_t>(n));
+        }
+        httplib::detail::shutdown_socket(sock); httplib::detail::close_socket(sock);
+        CHECK(response.find("413") != std::string::npos && response.find("Connection: close") != std::string::npos);
+        CHECK(handled == 2);
+    }
+    // The lower-level reader also bounds bodies delimited by EOF.
+    httplib::detail::BufferStream input;
+    const std::string eofBody(2048, 'x');
+    input.write(eofBody.data(), eofBody.size());
+    httplib::Request request;
+    int status = 0; size_t received = 0;
+    CHECK(!httplib::detail::read_content(input, request, 1024, status, nullptr,
+        [&](const char*, size_t n, uint64_t, uint64_t) { received += n; return true; }, false));
+    CHECK(status == 413 && received <= 1024);
+}
 int main() {
-    try { CaptureTests(); FramingTests(); NetworkTests(); std::cout << "PASS: native capture, framing, concurrency, incremental HTTP delivery and disconnect\n"; }
+    try { CaptureTests(); UnicodeCaptureTests(); FramingTests(); NetworkTests(); PayloadLimitTests(); std::cout << "PASS: native capture/UTF-8, payload limits, framing, concurrency, incremental HTTP delivery and disconnect\n"; }
     catch (const std::exception& error) { std::cerr << "FAIL: " << error.what() << '\n'; return 1; }
 }

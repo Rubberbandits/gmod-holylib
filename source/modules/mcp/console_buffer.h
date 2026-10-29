@@ -10,6 +10,35 @@
 #include <vector>
 
 namespace HolyConsole {
+// Treat genuinely invalid input as single bytes; JSON repairs those later.
+// Valid code points must stay intact across records and continuation cursors.
+inline size_t UTF8Unit(const char* text, size_t length) {
+    if (!length) return 0;
+    const auto a = static_cast<unsigned char>(text[0]);
+    const size_t n = a < 128 ? 1 : (a >= 194 && a <= 223 ? 2 : (a >= 224 && a <= 239 ? 3 : (a >= 240 && a <= 244 ? 4 : 0)));
+    if (!n || n > length) return 1;
+    for (size_t i = 1; i < n; ++i) if ((static_cast<unsigned char>(text[i]) & 192) != 128) return 1;
+    if (n >= 3) {
+        const auto b = static_cast<unsigned char>(text[1]);
+        if ((a == 224 && b < 160) || (a == 237 && b >= 160) || (a == 240 && b < 144) || (a == 244 && b >= 144)) return 1;
+    }
+    return n;
+}
+inline size_t UTF8Prefix(const char* text, size_t length, size_t limit, bool allowFirst = false) {
+    size_t used = 0;
+    while (used < length) {
+        const size_t n = UTF8Unit(text + used, length - used);
+        if (n > limit - used) return used == 0 && allowFirst && limit > 0 ? n : used;
+        used += n;
+        if (used == limit) break;
+    }
+    return used;
+}
+inline bool UTF8Boundary(const std::string& text, size_t offset) {
+    for (size_t i = offset > 3 ? offset - 3 : 0; i < offset; ++i)
+        if (UTF8Unit(text.data() + i, text.size() - i) > offset - i) return false;
+    return true;
+}
 inline thread_local unsigned deliveryDepth = 0;
 struct DeliveryScope { DeliveryScope() { ++deliveryDepth; } ~DeliveryScope() { --deliveryDepth; } };
 struct Record {
@@ -46,11 +75,13 @@ public:
         if (deliveryDepth || !length) return;
         const double timestamp = std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count();
         std::lock_guard<std::mutex> lock(mutex);
-        for (size_t offset = 0; offset < length; offset += 8192) {
+        for (size_t offset = 0; offset < length;) {
             Record r;
             r.sequence = next++; r.timestamp = timestamp; r.channel = channel; r.level = level;
             r.severity = severity; r.channelID = channelID;
-            r.text.assign(text + offset, std::min(size_t(8192), length - offset));
+            const size_t take = UTF8Prefix(text + offset, length - offset, 8192);
+            r.text.assign(text + offset, take);
+            offset += take;
             if (color) std::copy(color, color + 4, r.color);
             bytes += r.text.size(); records.push_back(std::move(r));
             while (!records.empty() && (bytes > byteLimit || records.size() > recordLimit)) {
@@ -73,7 +104,8 @@ public:
                 && seqText.find_first_not_of("0123456789") == std::string::npos && offsetText.find_first_not_of("0123456789") == std::string::npos;
             try { if (valid) { sequence = std::stoull(seqText); offset = std::stoull(offsetText); } } catch (...) { valid = false; }
             if (!valid || sequence < earliest || sequence > next || (sequence == next && offset != 0)
-                || (sequence < next && offset > records[size_t(sequence - earliest)].text.size())) {
+                || (sequence < next && (offset > records[size_t(sequence - earliest)].text.size()
+                    || !UTF8Boundary(records[size_t(sequence - earliest)].text, offset)))) {
                 batch.reset = true;
                 batch.dropped = valid && sequence < earliest ? earliest - sequence : dropped;
                 sequence = earliest; offset = 0;
@@ -85,7 +117,9 @@ public:
             if (source.sequence < sequence) continue;
             if (batch.records.size() >= maxRecords || used >= maxBytes) break;
             const size_t start = source.sequence == sequence ? offset : 0;
-            const size_t take = std::min(source.text.size() - start, maxBytes - used);
+            // Return one complete code point even when a caller asks for fewer
+            // bytes, so every nonempty read advances (at most 3 bytes extra).
+            const size_t take = UTF8Prefix(source.text.data() + start, source.text.size() - start, maxBytes - used, used == 0);
             if (take) {
                 Record r = source; r.text = source.text.substr(start, take);
                 r.cursor = start + take == source.text.size() ? Cursor(source.sequence + 1) : Cursor(source.sequence, start + take);
