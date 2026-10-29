@@ -275,6 +275,7 @@ namespace Lua
 		LuaInterface,
 		// WavAudioFile,
 		IGModAudioChannelEncoder,
+		HttpStream,
 
 		_HOLYLIB_CORE_TEST_REFERENCED = UCHAR_MAX-2,
 		_HOLYLIB_CORE_TEST = UCHAR_MAX-1,

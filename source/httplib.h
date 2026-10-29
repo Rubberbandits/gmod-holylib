@@ -6502,9 +6502,9 @@ inline void Server::wait_until_ready() const {
 }
 
 inline void Server::stop() {
-  if (is_running_) {
-	assert(svr_sock_ != INVALID_SOCKET);
-	std::atomic<socket_t> sock(svr_sock_.exchange(INVALID_SOCKET));
+  // Also close a bound listener before listen_after_bind's thread has started.
+  const socket_t sock = svr_sock_.exchange(INVALID_SOCKET);
+  if (sock != INVALID_SOCKET) {
 	detail::shutdown_socket(sock);
 	detail::close_socket(sock);
   }
@@ -6678,7 +6678,7 @@ Server::write_content_with_provider(Stream &strm, const Request &req,
 	}
   } else {
 	if (res.is_chunked_content_provider_) {
-	  auto type = detail::encoding_type(req, res);
+	  auto type = res.get_header_value("Content-Encoding") == "identity" ? detail::EncodingType::None : detail::encoding_type(req, res);
 
 	  std::unique_ptr<detail::compressor> compressor;
 	  if (type == detail::EncodingType::Gzip) {
@@ -7099,7 +7099,7 @@ inline void Server::apply_ranges(const Request &req, Response &res,
 				   "multipart/byteranges; boundary=" + boundary);
   }
 
-  auto type = detail::encoding_type(req, res);
+  auto type = res.get_header_value("Content-Encoding") == "identity" ? detail::EncodingType::None : detail::encoding_type(req, res);
 
   if (res.body.empty()) {
 	if (res.content_length_ > 0) {

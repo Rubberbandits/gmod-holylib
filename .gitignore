@@ -18,6 +18,7 @@ development/64x/
 development/garrysmod_common/
 development/module/projects/**
 _builds/**
+__pycache__/
 
 # generated files
 source/modules/_modules.h
@@ -33,6 +34,7 @@ source/modules/_modules.cpp
 source/sourcesdk/luagc_jit.cpp
 
 projects/windows/vs2022/
+projects/linux/gmake/
 **.pdb
 luajit/src/luajit.vcxproj/**
 **.ilk

@@ -3,6 +3,7 @@
 #include "public/imodule.h"
 #include <vector>
 #include <shared_mutex>
+#include <mutex>
 #include <atomic>
 #include "unordered_stuff.h"
 #include "public/iconfigsystem.h"
